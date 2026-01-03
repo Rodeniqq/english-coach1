@@ -4,17 +4,11 @@ import { NextResponse } from "next/server";
 export const runtime = "nodejs";
 
 type Msg = { role: "user" | "assistant"; content: string };
+type Body = { messages?: Msg[] };
 
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as { messages?: Msg[] };
-    const messagesRaw = body.messages ?? [];
-
-    // ✅ Sanitize básico (solo roles válidos + content string)
-    const messages: Msg[] = messagesRaw
-      .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
-      .map((m) => ({ role: m.role, content: m.content.trim() }))
-      .filter((m) => m.content.length > 0);
+    const { messages = [] } = (await req.json()) as Body;
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
@@ -23,37 +17,34 @@ export async function POST(req: Request) {
 
     const model = process.env.OPENAI_MODEL || "gpt-5";
 
-    // ✅ Instrucciones desde Vercel (tu prompt “friendly V2”)
     const instructions =
       process.env.COACH_INSTRUCTIONS ||
-      "Eres un tutor de inglés cercano y motivador. Responde en micro-pasos (máximo 2 preguntas por turno).";
+      "Eres un tutor de inglés cercano y motivador. Responde en micro-pasos (máximo 2 preguntas).";
 
     const client = new OpenAI({ apiKey });
 
-    // ✅ Si es primera interacción (solo 1 mensaje del user), fuerza bienvenida breve
-    const isFirstTurn = messages.length <= 1;
+    // ✅ Mejor detección de “primer turno”: cuenta mensajes del usuario
+    const userTurns = messages.filter((m) => m.role === "user").length;
+    const isFirstTurn = userTurns <= 1;
+
+    const input = [
+      { role: "developer", content: instructions },
+      ...(isFirstTurn
+        ? [
+            {
+              role: "developer",
+              content:
+                "INICIO: Sé breve, cálido y motivador. Máximo 2 preguntas. No des tests largos ni planes extensos.",
+            },
+          ]
+        : []),
+      ...messages,
+    ] as any;
 
     const response = await client.responses.create({
       model,
-      // ✅ CAPA de longitud para evitar “ladrillos”
       max_output_tokens: isFirstTurn ? 260 : 350,
-
-      input: [
-        { role: "developer", content: instructions },
-
-        // ✅ Empujón de estilo SOLO al inicio (opcional pero ayuda muchísimo)
-        ...(isFirstTurn
-          ? [
-              {
-                role: "developer",
-                content:
-                  "INICIO: Sé ultra breve, cálido y motivador. Haz solo 2 preguntas. No entregues tests largos ni planes extensos.",
-              },
-            ]
-          : []),
-
-        ...messages,
-      ],
+      input,
     });
 
     return NextResponse.json({ reply: response.output_text ?? "" });
