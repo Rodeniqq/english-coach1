@@ -3,8 +3,6 @@ import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
 type Msg = { role: "user" | "assistant"; content: string };
 
 export async function POST(req: Request) {
@@ -19,17 +17,16 @@ export async function POST(req: Request) {
 
     const model = process.env.OPENAI_MODEL || "gpt-5";
 
-    // Responses API (recomendada para proyectos nuevos)
+    // ✅ Tus instrucciones desde Vercel
+    const instructions =
+      process.env.COACH_INSTRUCTIONS ||
+      "Eres un asistente experto en enseñanza de inglés. (Falta COACH_INSTRUCTIONS en Vercel).";
+
+    const client = new OpenAI({ apiKey });
+
     const response = await client.responses.create({
       model,
-      input: [
-        {
-          role: "developer",
-          content:
-            "Eres un profesor de inglés. Corrige con tacto, explica breve y claro, y luego haz una pregunta para continuar. Si el usuario escribe en español, responde en español pero enseña inglés.",
-        },
-        ...messages,
-      ],
+      input: [{ role: "developer", content: instructions }, ...messages],
     });
 
     return NextResponse.json({ reply: response.output_text ?? "" });
