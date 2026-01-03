@@ -8,7 +8,13 @@ type Msg = { role: "user" | "assistant"; content: string };
 export async function POST(req: Request) {
   try {
     const body = (await req.json()) as { messages?: Msg[] };
-    const messages = body.messages ?? [];
+    const messagesRaw = body.messages ?? [];
+
+    // ✅ Sanitize básico (solo roles válidos + content string)
+    const messages: Msg[] = messagesRaw
+      .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+      .map((m) => ({ role: m.role, content: m.content.trim() }))
+      .filter((m) => m.content.length > 0);
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
@@ -17,16 +23,37 @@ export async function POST(req: Request) {
 
     const model = process.env.OPENAI_MODEL || "gpt-5";
 
-    // ✅ Tus instrucciones desde Vercel
+    // ✅ Instrucciones desde Vercel (tu prompt “friendly V2”)
     const instructions =
       process.env.COACH_INSTRUCTIONS ||
-      "Eres un asistente experto en enseñanza de inglés. (Falta COACH_INSTRUCTIONS en Vercel).";
+      "Eres un tutor de inglés cercano y motivador. Responde en micro-pasos (máximo 2 preguntas por turno).";
 
     const client = new OpenAI({ apiKey });
 
+    // ✅ Si es primera interacción (solo 1 mensaje del user), fuerza bienvenida breve
+    const isFirstTurn = messages.length <= 1;
+
     const response = await client.responses.create({
       model,
-      input: [{ role: "developer", content: instructions }, ...messages],
+      // ✅ CAPA de longitud para evitar “ladrillos”
+      max_output_tokens: isFirstTurn ? 260 : 350,
+
+      input: [
+        { role: "developer", content: instructions },
+
+        // ✅ Empujón de estilo SOLO al inicio (opcional pero ayuda muchísimo)
+        ...(isFirstTurn
+          ? [
+              {
+                role: "developer",
+                content:
+                  "INICIO: Sé ultra breve, cálido y motivador. Haz solo 2 preguntas. No entregues tests largos ni planes extensos.",
+              },
+            ]
+          : []),
+
+        ...messages,
+      ],
     });
 
     return NextResponse.json({ reply: response.output_text ?? "" });
