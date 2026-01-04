@@ -1,46 +1,131 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 type Msg = { role: "user" | "assistant"; content: string };
 
 export default function Home() {
   const [messages, setMessages] = useState<Msg[]>([
-    { role: "assistant", content: "Hi! I’m your English Coach. Tell me what you want to practice today." },
+    {
+      role: "assistant",
+      content: "Hi! I’m your English Coach. Tell me what you want to practice today.",
+    },
   ]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
 
-  const canSend = useMemo(() => input.trim().length > 0 && !loading, [input, loading]);
+  // Para poder abortar si el usuario manda otro mensaje o recarga
+  const abortRef = useRef<AbortController | null>(null);
+
+  const canSend = useMemo(
+    () => input.trim().length > 0 && !loading,
+    [input, loading]
+  );
 
   async function send() {
     if (!canSend) return;
 
-    const userMsg: Msg = { role: "user", content: input.trim() };
-    const next = [...messages, userMsg];
+    // Si había un stream anterior, lo cortamos
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
 
-    setMessages(next);
+    const userMsg: Msg = { role: "user", content: input.trim() };
+
+    // 1) armamos el historial + placeholder del assistant
+    const nextWithUser = [...messages, userMsg];
+    const nextWithPlaceholder: Msg[] = [
+      ...nextWithUser,
+      { role: "assistant", content: "" },
+    ];
+
+    setMessages(nextWithPlaceholder);
     setInput("");
     setLoading(true);
 
     try {
+      // 2) Mandamos al backend SOLO los mensajes reales (sin el placeholder vacío)
+      // y filtramos assistant vacíos
+      const payloadMessages = nextWithUser.filter((m) => m.content?.trim().length > 0);
+
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: next.filter(m => m.role !== "assistant" || m.content) }),
+        body: JSON.stringify({ messages: payloadMessages }),
+        signal: controller.signal,
       });
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error ? JSON.stringify(data.error) : "API error");
+      if (!res.ok) {
+        // si backend devolviera JSON de error
+        let errText = `API error (${res.status})`;
+        try {
+          const j = await res.json();
+          errText = j?.error ? JSON.stringify(j.error) : errText;
+        } catch {}
+        throw new Error(errText);
+      }
 
-      setMessages(prev => [...prev, { role: "assistant", content: data.reply || "…" }]);
+      if (!res.body) throw new Error("No stream body returned");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+
+      let assistantText = "";
+
+      // 3) Leemos el stream y vamos pintando el último mensaje (placeholder)
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        assistantText += decoder.decode(value, { stream: true });
+
+        setMessages((prev) => {
+          const copy = [...prev];
+          const lastIndex = copy.length - 1;
+          if (lastIndex >= 0 && copy[lastIndex].role === "assistant") {
+            copy[lastIndex] = { role: "assistant", content: assistantText };
+          }
+          return copy;
+        });
+      }
+
+      // Si por alguna razón llegó vacío, ponemos algo
+      if (!assistantText.trim()) {
+        setMessages((prev) => {
+          const copy = [...prev];
+          const lastIndex = copy.length - 1;
+          if (lastIndex >= 0 && copy[lastIndex].role === "assistant") {
+            copy[lastIndex] = { role: "assistant", content: "…" };
+          }
+          return copy;
+        });
+      }
     } catch (e: any) {
-      setMessages(prev => [
-        ...prev,
-        { role: "assistant", content: `Error: ${e?.message ?? "no se pudo responder"}` },
-      ]);
+      // Si fue abortado por un nuevo mensaje, no mostramos error
+      if (e?.name === "AbortError") return;
+
+      setMessages((prev) => {
+        const copy = [...prev];
+
+        // si el último era placeholder assistant, lo reemplazamos por error
+        const lastIndex = copy.length - 1;
+        if (lastIndex >= 0 && copy[lastIndex].role === "assistant" && copy[lastIndex].content === "") {
+          copy[lastIndex] = {
+            role: "assistant",
+            content: `Error: ${e?.message ?? "no se pudo responder"}`,
+          };
+          return copy;
+        }
+
+        // si no, agregamos un mensaje nuevo
+        return [
+          ...copy,
+          { role: "assistant", content: `Error: ${e?.message ?? "no se pudo responder"}` },
+        ];
+      });
     } finally {
       setLoading(false);
+      abortRef.current = null;
     }
   }
 
@@ -48,24 +133,28 @@ export default function Home() {
     <main className="min-h-screen bg-black text-white">
       <div className="mx-auto max-w-3xl px-4 py-8">
         <h1 className="text-2xl font-semibold">English Coach</h1>
-        <p className="text-white/60 mt-1">Practica conversación, correcciones y vocabulario.</p>
+        <p className="text-white/60 mt-1">
+          Practica conversación, correcciones y vocabulario.
+        </p>
 
         <div className="mt-6 rounded-xl border border-white/10 bg-white/5 p-4 space-y-3">
           {messages.map((m, i) => (
             <div key={i} className={m.role === "user" ? "text-right" : "text-left"}>
               <div
                 className={
-                  "inline-block max-w-[85%] rounded-2xl px-4 py-2 " +
-                  (m.role === "user"
-                    ? "bg-white text-black"
-                    : "bg-white/10 text-white")
+                  "inline-block max-w-[85%] rounded-2xl px-4 py-2 whitespace-pre-wrap " +
+                  (m.role === "user" ? "bg-white text-black" : "bg-white/10 text-white")
                 }
               >
-                {m.content}
+                {m.content || (m.role === "assistant" && loading && i === messages.length - 1 ? "…" : "")}
               </div>
             </div>
           ))}
-          {loading && <div className="text-white/50">Thinking…</div>}
+          {loading && (
+            <div className="text-white/50 text-sm">
+              Streaming…
+            </div>
+          )}
         </div>
 
         <div className="mt-4 flex gap-2">
@@ -75,6 +164,7 @@ export default function Home() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => (e.key === "Enter" ? send() : null)}
+            disabled={loading}
           />
           <button
             className="rounded-xl px-4 py-3 bg-white text-black disabled:opacity-50"
