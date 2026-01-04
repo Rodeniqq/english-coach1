@@ -23,7 +23,6 @@ export async function POST(req: Request) {
 
     const client = new OpenAI({ apiKey });
 
-    // mejor que messages.length, porque tu UI ya tiene un saludo del assistant
     const userTurns = messages.filter((m) => m.role === "user").length;
     const isFirstTurn = userTurns <= 1;
 
@@ -41,7 +40,6 @@ export async function POST(req: Request) {
       ...messages,
     ];
 
-    // ✅ Streaming Responses API
     const stream = await client.responses.create({
       model,
       input,
@@ -53,18 +51,38 @@ export async function POST(req: Request) {
 
     const readable = new ReadableStream({
       async start(controller) {
+        const send = (obj: any) => {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+        };
+
+        // primer “byte” para que el navegador empiece a renderizar
+        controller.enqueue(encoder.encode(`:ok\n\n`));
+
+        let gotDelta = false;
+
         try {
           for await (const event of stream as any) {
-            if (event?.type === "response.output_text.delta" && event?.delta) {
-              controller.enqueue(encoder.encode(event.delta));
+            // ✅ deltas de texto (lo normal)
+            if (event?.type === "response.output_text.delta" && typeof event.delta === "string") {
+              gotDelta = true;
+              send({ delta: event.delta });
             }
+
+            // ✅ fallback: algunos flujos emiten el texto final en *.done
+            if (!gotDelta && event?.type === "response.output_text.done" && typeof event.text === "string") {
+              send({ delta: event.text });
+            }
+
             if (event?.type === "response.completed") break;
-            if (event?.type === "error") break;
+            if (event?.type === "error" || event?.type === "response.failed") {
+              send({ error: "Error en streaming" });
+              break;
+            }
           }
+
+          send({ done: true });
         } catch (e: any) {
-          controller.enqueue(
-            encoder.encode(`\n[stream_error] ${e?.message ?? "unknown"}\n`)
-          );
+          send({ error: e?.message ?? "stream_error" });
         } finally {
           controller.close();
         }
@@ -73,8 +91,10 @@ export async function POST(req: Request) {
 
     return new Response(readable, {
       headers: {
-        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
       },
     });
   } catch (err: any) {

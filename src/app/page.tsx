@@ -14,7 +14,6 @@ export default function Home() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
 
-  // Para poder abortar si el usuario manda otro mensaje o recarga
   const abortRef = useRef<AbortController | null>(null);
 
   const canSend = useMemo(
@@ -25,27 +24,20 @@ export default function Home() {
   async function send() {
     if (!canSend) return;
 
-    // Si había un stream anterior, lo cortamos
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
 
     const userMsg: Msg = { role: "user", content: input.trim() };
-
-    // 1) armamos el historial + placeholder del assistant
     const nextWithUser = [...messages, userMsg];
-    const nextWithPlaceholder: Msg[] = [
-      ...nextWithUser,
-      { role: "assistant", content: "" },
-    ];
 
-    setMessages(nextWithPlaceholder);
+    // Placeholder del assistant para ir llenándolo
+    setMessages([...nextWithUser, { role: "assistant", content: "" }]);
     setInput("");
     setLoading(true);
 
     try {
-      // 2) Mandamos al backend SOLO los mensajes reales (sin el placeholder vacío)
-      // y filtramos assistant vacíos
+      // Enviamos mensajes reales (sin el placeholder vacío)
       const payloadMessages = nextWithUser.filter((m) => m.content?.trim().length > 0);
 
       const res = await fetch("/api/chat", {
@@ -56,7 +48,6 @@ export default function Home() {
       });
 
       if (!res.ok) {
-        // si backend devolviera JSON de error
         let errText = `API error (${res.status})`;
         try {
           const j = await res.json();
@@ -71,57 +62,74 @@ export default function Home() {
       const decoder = new TextDecoder();
 
       let assistantText = "";
+      let buffer = "";
 
-      // 3) Leemos el stream y vamos pintando el último mensaje (placeholder)
+      const pushAssistant = (text: string) => {
+        setMessages((prev) => {
+          const copy = [...prev];
+          const last = copy.length - 1;
+          if (last >= 0 && copy[last].role === "assistant") {
+            copy[last] = { role: "assistant", content: text };
+          }
+          return copy;
+        });
+      };
+
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
 
-        assistantText += decoder.decode(value, { stream: true });
+        buffer += decoder.decode(value, { stream: true });
 
-        setMessages((prev) => {
-          const copy = [...prev];
-          const lastIndex = copy.length - 1;
-          if (lastIndex >= 0 && copy[lastIndex].role === "assistant") {
-            copy[lastIndex] = { role: "assistant", content: assistantText };
+        // Parse SSE por bloques separados por "\n\n"
+        let idx: number;
+        while ((idx = buffer.indexOf("\n\n")) !== -1) {
+          const chunk = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+
+          // Ignora comentarios SSE (líneas que empiezan con :)
+          if (chunk.startsWith(":")) continue;
+
+          // Extrae líneas "data: ..."
+          const lines = chunk.split("\n");
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const dataStr = line.slice(5).trim();
+            if (!dataStr) continue;
+
+            const data = JSON.parse(dataStr);
+
+            if (data.error) {
+              throw new Error(data.error);
+            }
+
+            if (typeof data.delta === "string") {
+              assistantText += data.delta;
+              pushAssistant(assistantText);
+            }
+
+            if (data.done) {
+              // terminado
+              break;
+            }
           }
-          return copy;
-        });
+        }
       }
 
-      // Si por alguna razón llegó vacío, ponemos algo
       if (!assistantText.trim()) {
-        setMessages((prev) => {
-          const copy = [...prev];
-          const lastIndex = copy.length - 1;
-          if (lastIndex >= 0 && copy[lastIndex].role === "assistant") {
-            copy[lastIndex] = { role: "assistant", content: "…" };
-          }
-          return copy;
-        });
+        pushAssistant("…");
       }
     } catch (e: any) {
-      // Si fue abortado por un nuevo mensaje, no mostramos error
       if (e?.name === "AbortError") return;
 
       setMessages((prev) => {
         const copy = [...prev];
-
-        // si el último era placeholder assistant, lo reemplazamos por error
-        const lastIndex = copy.length - 1;
-        if (lastIndex >= 0 && copy[lastIndex].role === "assistant" && copy[lastIndex].content === "") {
-          copy[lastIndex] = {
-            role: "assistant",
-            content: `Error: ${e?.message ?? "no se pudo responder"}`,
-          };
+        const last = copy.length - 1;
+        if (last >= 0 && copy[last].role === "assistant" && copy[last].content === "") {
+          copy[last] = { role: "assistant", content: `Error: ${e?.message ?? "falló"}` };
           return copy;
         }
-
-        // si no, agregamos un mensaje nuevo
-        return [
-          ...copy,
-          { role: "assistant", content: `Error: ${e?.message ?? "no se pudo responder"}` },
-        ];
+        return [...copy, { role: "assistant", content: `Error: ${e?.message ?? "falló"}` }];
       });
     } finally {
       setLoading(false);
@@ -133,9 +141,7 @@ export default function Home() {
     <main className="min-h-screen bg-black text-white">
       <div className="mx-auto max-w-3xl px-4 py-8">
         <h1 className="text-2xl font-semibold">English Coach</h1>
-        <p className="text-white/60 mt-1">
-          Practica conversación, correcciones y vocabulario.
-        </p>
+        <p className="text-white/60 mt-1">Practica conversación, correcciones y vocabulario.</p>
 
         <div className="mt-6 rounded-xl border border-white/10 bg-white/5 p-4 space-y-3">
           {messages.map((m, i) => (
@@ -150,11 +156,7 @@ export default function Home() {
               </div>
             </div>
           ))}
-          {loading && (
-            <div className="text-white/50 text-sm">
-              Streaming…
-            </div>
-          )}
+          {loading && <div className="text-white/50 text-sm">Streaming…</div>}
         </div>
 
         <div className="mt-4 flex gap-2">
