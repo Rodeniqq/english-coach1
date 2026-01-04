@@ -16,29 +16,46 @@ export default function Home() {
 
   const abortRef = useRef<AbortController | null>(null);
 
-  const canSend = useMemo(
-    () => input.trim().length > 0 && !loading,
-    [input, loading]
-  );
+  // ✅ permite enviar aunque esté cargando (aborta el stream anterior)
+  const canSend = useMemo(() => input.trim().length > 0, [input]);
+
+  function removeEmptyAssistantPlaceholders(list: Msg[]) {
+    // elimina cualquier assistant vacío que haya quedado pegado
+    return list.filter((m) => !(m.role === "assistant" && m.content.trim() === ""));
+  }
 
   async function send() {
     if (!canSend) return;
 
+    // aborta cualquier stream anterior
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
 
-    const userMsg: Msg = { role: "user", content: input.trim() };
-    const nextWithUser = [...messages, userMsg];
+    // limpia placeholders viejos antes de continuar
+    const cleaned = removeEmptyAssistantPlaceholders(messages);
 
-    // Placeholder del assistant para ir llenándolo
+    const userMsg: Msg = { role: "user", content: input.trim() };
+    const nextWithUser = [...cleaned, userMsg];
+
+    // placeholder del assistant (se va llenando)
     setMessages([...nextWithUser, { role: "assistant", content: "" }]);
     setInput("");
     setLoading(true);
 
+    const pushAssistant = (text: string) => {
+      setMessages((prev) => {
+        const copy = [...prev];
+        const last = copy.length - 1;
+        if (last >= 0 && copy[last].role === "assistant") {
+          copy[last] = { role: "assistant", content: text };
+        }
+        return copy;
+      });
+    };
+
     try {
-      // Enviamos mensajes reales (sin el placeholder vacío)
-      const payloadMessages = nextWithUser.filter((m) => m.content?.trim().length > 0);
+      const payloadMessages = nextWithUser.filter((m) => m.content.trim().length > 0);
 
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -56,6 +73,15 @@ export default function Home() {
         throw new Error(errText);
       }
 
+      const contentType = (res.headers.get("content-type") || "").toLowerCase();
+
+      // 1) ✅ Si es JSON (modo antiguo)
+      if (contentType.includes("application/json")) {
+        const data = await res.json();
+        pushAssistant(data?.reply || "…");
+        return;
+      }
+
       if (!res.body) throw new Error("No stream body returned");
 
       const reader = res.body.getReader();
@@ -64,73 +90,61 @@ export default function Home() {
       let assistantText = "";
       let buffer = "";
 
-      const pushAssistant = (text: string) => {
-        setMessages((prev) => {
-          const copy = [...prev];
-          const last = copy.length - 1;
-          if (last >= 0 && copy[last].role === "assistant") {
-            copy[last] = { role: "assistant", content: text };
-          }
-          return copy;
-        });
-      };
+      // 2) ✅ SSE (text/event-stream)
+      if (contentType.includes("text/event-stream")) {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
 
+          buffer += decoder.decode(value, { stream: true });
+          buffer = buffer.replace(/\r/g, ""); // normaliza CRLF
+
+          let idx: number;
+          while ((idx = buffer.indexOf("\n\n")) !== -1) {
+            const chunk = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+
+            if (chunk.startsWith(":")) continue; // comentario SSE
+
+            for (const line of chunk.split("\n")) {
+              if (!line.startsWith("data:")) continue;
+              const dataStr = line.slice(5).trim();
+              if (!dataStr) continue;
+
+              const data = JSON.parse(dataStr);
+
+              if (data.error) throw new Error(data.error);
+
+              if (typeof data.delta === "string") {
+                assistantText += data.delta;
+                pushAssistant(assistantText);
+              }
+
+              if (data.done) {
+                // terminado
+                break;
+              }
+            }
+          }
+        }
+
+        if (!assistantText.trim()) pushAssistant("…");
+        return;
+      }
+
+      // 3) ✅ Texto plano streaming (text/plain u otros)
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-
-        // Parse SSE por bloques separados por "\n\n"
-        let idx: number;
-        while ((idx = buffer.indexOf("\n\n")) !== -1) {
-          const chunk = buffer.slice(0, idx);
-          buffer = buffer.slice(idx + 2);
-
-          // Ignora comentarios SSE (líneas que empiezan con :)
-          if (chunk.startsWith(":")) continue;
-
-          // Extrae líneas "data: ..."
-          const lines = chunk.split("\n");
-          for (const line of lines) {
-            if (!line.startsWith("data:")) continue;
-            const dataStr = line.slice(5).trim();
-            if (!dataStr) continue;
-
-            const data = JSON.parse(dataStr);
-
-            if (data.error) {
-              throw new Error(data.error);
-            }
-
-            if (typeof data.delta === "string") {
-              assistantText += data.delta;
-              pushAssistant(assistantText);
-            }
-
-            if (data.done) {
-              // terminado
-              break;
-            }
-          }
-        }
+        assistantText += decoder.decode(value, { stream: true });
+        pushAssistant(assistantText);
       }
 
-      if (!assistantText.trim()) {
-        pushAssistant("…");
-      }
+      if (!assistantText.trim()) pushAssistant("…");
     } catch (e: any) {
       if (e?.name === "AbortError") return;
-
-      setMessages((prev) => {
-        const copy = [...prev];
-        const last = copy.length - 1;
-        if (last >= 0 && copy[last].role === "assistant" && copy[last].content === "") {
-          copy[last] = { role: "assistant", content: `Error: ${e?.message ?? "falló"}` };
-          return copy;
-        }
-        return [...copy, { role: "assistant", content: `Error: ${e?.message ?? "falló"}` }];
-      });
+      pushAssistant(`Error: ${e?.message ?? "no se pudo responder"}`);
     } finally {
       setLoading(false);
       abortRef.current = null;
@@ -141,7 +155,9 @@ export default function Home() {
     <main className="min-h-screen bg-black text-white">
       <div className="mx-auto max-w-3xl px-4 py-8">
         <h1 className="text-2xl font-semibold">English Coach</h1>
-        <p className="text-white/60 mt-1">Practica conversación, correcciones y vocabulario.</p>
+        <p className="text-white/60 mt-1">
+          Practica conversación, correcciones y vocabulario.
+        </p>
 
         <div className="mt-6 rounded-xl border border-white/10 bg-white/5 p-4 space-y-3">
           {messages.map((m, i) => (
@@ -152,11 +168,11 @@ export default function Home() {
                   (m.role === "user" ? "bg-white text-black" : "bg-white/10 text-white")
                 }
               >
-                {m.content || (m.role === "assistant" && loading && i === messages.length - 1 ? "…" : "")}
+                {m.content || (m.role === "assistant" && loading && i === messages.length - 1 ? "..." : "")}
               </div>
             </div>
           ))}
-          {loading && <div className="text-white/50 text-sm">Streaming…</div>}
+          {loading && <div className="text-white/50 text-sm">Streaming...</div>}
         </div>
 
         <div className="mt-4 flex gap-2">
@@ -166,7 +182,6 @@ export default function Home() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => (e.key === "Enter" ? send() : null)}
-            disabled={loading}
           />
           <button
             className="rounded-xl px-4 py-3 bg-white text-black disabled:opacity-50"
